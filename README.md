@@ -20,14 +20,14 @@ A powerful, lightweight iOS tracking SDK with automatic event tracking, minimal 
 Add TrackKit to your project using Xcode:
 
 1. File → Add Package Dependencies
-2. Enter the repository URL: `https://github.com/yourusername/TrackKit`
+2. Enter the repository URL: `https://github.com/tyler-ng/TrackKit`
 3. Select the version and add to your target
 
 Or add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/yourusername/TrackKit", from: "1.0.0")
+    .package(url: "https://github.com/tyler-ng/TrackKit", from: "1.0.0")
 ]
 ```
 
@@ -322,7 +322,7 @@ TrackKit is available under the MIT license. See the LICENSE file for more info.
 ## Support
 
 - 📧 Email: support@trackkit.dev
-- 🐛 Issues: [GitHub Issues](https://github.com/yourusername/TrackKit/issues)
+- 🐛 Issues: [GitHub Issues](https://github.com/tyler-ng/TrackKit/issues)
 - 📖 Documentation: [Full Documentation](https://docs.trackkit.dev)
 
 ---
