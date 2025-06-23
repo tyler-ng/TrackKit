@@ -1,17 +1,17 @@
 # TrackKit iOS SDK
 
-A powerful, lightweight iOS tracking SDK with automatic event tracking, minimal performance impact, and flexible backend integration.
+A powerful, lightweight iOS tracking SDK with automatic event tracking, minimal performance impact, and flexible backend integration. Built for iOS 15+ with modern async/await support.
 
 ## Features
 
 - 🎯 **Automatic Event Tracking**: UIViewController views, button taps, and crashes
-- 📱 **iOS Optimized**: Built specifically for iOS 12+ using UIKit
-- ⚡ **High Performance**: Minimal impact on app performance with background processing
+- 📱 **iOS 15+ Optimized**: Built specifically for iOS 15+ using modern Swift concurrency
+- ⚡ **High Performance**: Minimal impact on app performance with structured concurrency
 - 🔄 **Intelligent Batching**: Efficient event batching with configurable batch sizes
 - 🛡️ **Error Handling**: Automatic crash detection and error tracking
 - 🌐 **Flexible API**: Support for multiple backend configurations
 - 📊 **Rich Context**: Automatic device, app, and session information
-- 🔧 **Thread Safe**: All operations are thread-safe and non-blocking
+- 🔧 **Thread Safe**: All operations use modern Swift concurrency patterns
 
 ## Installation
 
@@ -41,11 +41,13 @@ In your `AppDelegate` or `SceneDelegate`:
 import TrackKit
 
 func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
-    // Basic configuration
-    TrackKit.configure(apiKey: "your-api-key", endpoint: "https://your-api.com")
-    
-    // Enable auto-tracking
-    TrackKit.enableAutoTracking(true)
+    Task {
+        // Basic configuration
+        await TrackKit.configure(apiKey: "your-api-key", endpoint: "https://your-api.com")
+        
+        // Enable auto-tracking
+        await TrackKit.enableAutoTracking(true)
+    }
     
     return true
 }
@@ -55,26 +57,26 @@ func application(_ application: UIApplication, didFinishLaunchingWithOptions lau
 
 ```swift
 // Track custom events
-TrackKit.track(event: "user_signup", properties: [
+await TrackKit.track(event: "user_signup", properties: [
     "method": "email",
     "plan": "premium"
 ])
 
 // Track views
-TrackKit.trackView("HomeScreen")
+await TrackKit.trackView("HomeScreen")
 
 // Track button interactions
-TrackKit.trackButton("purchase_button")
+await TrackKit.trackButton("purchase_button")
 
 // Track errors
-TrackKit.trackError(error)
+await TrackKit.trackError(error)
 ```
 
 ### 3. Set User Information
 
 ```swift
-TrackKit.setUserId("user123")
-TrackKit.setUserProperties([
+await TrackKit.setUserId("user123")
+await TrackKit.setUserProperties([
     "name": "John Doe",
     "email": "john@example.com",
     "plan": "premium"
@@ -86,7 +88,7 @@ TrackKit.setUserProperties([
 ### Custom Endpoints
 
 ```swift
-TrackKit.configureWithCustomEndpoints(
+await TrackKit.configureWithCustomEndpoints(
     apiKey: "your-api-key",
     baseURL: "https://your-api.com",
     singleEventEndpoint: "/track",
@@ -116,7 +118,7 @@ config.autoTrackingEnabled = true
 // Performance
 config.maxQueueSize = 1000
 
-TrackKit.configure(with: config)
+await TrackKit.configure(with: config)
 ```
 
 ## Auto-Tracking
@@ -146,19 +148,23 @@ TrackKit automatically tracks:
 
 ```swift
 // Enable/disable auto-tracking
-TrackKit.enableAutoTracking(true)
+await TrackKit.enableAutoTracking(true)
 
-// Ignore specific view controllers (if using auto-tracking)
-let autoTracker = TrackKit.shared.autoTracker
-autoTracker?.ignoreViewControllers([UINavigationController.self])
-autoTracker?.ignoreViewControllerNames(["PrivacyViewController"])
+// Control specific tracking features
+await TrackKit.setViewTrackingEnabled(true)
+await TrackKit.setButtonTrackingEnabled(true)
+await TrackKit.setErrorTrackingEnabled(true)
+
+// Ignore specific view controllers
+await TrackKit.ignoreViewControllers([UINavigationController.self])
+await TrackKit.ignoreViewControllerNames(["PrivacyViewController"])
 ```
 
 ## Event Types
 
 ### Custom Events
 ```swift
-TrackKit.track(event: "purchase_completed", properties: [
+await TrackKit.track(event: "purchase_completed", properties: [
     "product_id": "premium_plan",
     "price": 9.99,
     "currency": "USD"
@@ -167,7 +173,7 @@ TrackKit.track(event: "purchase_completed", properties: [
 
 ### View Events
 ```swift
-TrackKit.trackView("ProductDetailScreen", properties: [
+await TrackKit.trackView("ProductDetailScreen", properties: [
     "product_id": "123",
     "category": "electronics"
 ])
@@ -175,7 +181,7 @@ TrackKit.trackView("ProductDetailScreen", properties: [
 
 ### Button Events
 ```swift
-TrackKit.trackButton("add_to_cart", properties: [
+await TrackKit.trackButton("add_to_cart", properties: [
     "product_id": "123",
     "source": "product_page"
 ])
@@ -183,7 +189,7 @@ TrackKit.trackButton("add_to_cart", properties: [
 
 ### Error Events
 ```swift
-TrackKit.trackError(error, properties: [
+await TrackKit.trackError(error, properties: [
     "context": "user_login",
     "retry_count": 3
 ])
@@ -196,10 +202,10 @@ TrackKit.trackError(error, properties: [
 - Critical events (errors) are sent immediately
 - Configurable batch sizes and intervals
 
-### Background Processing
-- All tracking operations happen on background queues
-- Non-blocking main thread
-- Automatic queue management
+### Structured Concurrency
+- All tracking operations use modern Swift concurrency
+- Non-blocking main actor operations
+- Automatic task cancellation and cleanup
 
 ### Memory Management
 - Automatic cleanup of old events
@@ -256,11 +262,6 @@ var config = TrackKitConfiguration.restAPI(
 
 ## Debugging
 
-### Enable Debug Logging
-```swift
-TrackKit.enableDebugLogging(true)
-```
-
 ### Check SDK Status
 ```swift
 if TrackKit.isConfigured {
@@ -268,27 +269,36 @@ if TrackKit.isConfigured {
 }
 
 print("SDK Version: \(TrackKit.version)")
+
+// Get auto-tracking statistics
+if let stats = TrackKit.autoTrackingStatistics {
+    print("Auto-tracking stats: \(stats)")
+}
 ```
 
 ### Manual Operations
 ```swift
 // Force send all pending events
-TrackKit.flush()
+await TrackKit.flush()
 
 // Reset SDK state
-TrackKit.reset()
+await TrackKit.reset()
 
 // Configure batching
-TrackKit.setBatchSize(10)
-TrackKit.setFlushInterval(30.0)
+await TrackKit.setBatchSize(10)
+await TrackKit.setFlushInterval(30.0)
+
+// Cancel all ongoing operations
+await TrackKit.cancelAllOperations()
 ```
 
-## Thread Safety
+## Concurrency & Thread Safety
 
-TrackKit is fully thread-safe:
-- All public methods can be called from any thread
-- Internal operations are synchronized
-- Background processing prevents main thread blocking
+TrackKit uses modern Swift concurrency:
+- All public methods are async and use structured concurrency
+- Main Actor isolation where appropriate for UI safety
+- Automatic task cancellation and cleanup
+- No callback hell or manual queue management
 
 ## Privacy
 
@@ -303,9 +313,9 @@ All data collection can be configured or disabled as needed.
 
 ## Requirements
 
-- iOS 12.0+
-- Xcode 12.0+
-- Swift 5.0+
+- iOS 15.0+
+- Xcode 14.0+
+- Swift 5.7+
 
 ## Contributing
 
@@ -317,14 +327,4 @@ All data collection can be configured or disabled as needed.
 
 ## License
 
-TrackKit is available under the MIT license. See the LICENSE file for more info.
-
-## Support
-
-- 📧 Email: support@trackkit.dev
-- 🐛 Issues: [GitHub Issues](https://github.com/tyler-ng/TrackKit/issues)
-- 📖 Documentation: [Full Documentation](https://docs.trackkit.dev)
-
----
-
-Made with ❤️ for iOS developers 
+TrackKit is available under the MIT license. See the LICENSE file for more info. 
