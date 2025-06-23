@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "TrackKit",
     platforms: [
-        .iOS(.v12)
+        .iOS(.v15)
     ],
     products: [
         .library(
@@ -17,7 +17,10 @@ let package = Package(
         .target(
             name: "TrackKit",
             dependencies: [],
-            path: "Sources/TrackKit"
+            path: "Sources/TrackKit",
+            swiftSettings: [
+                .enableUpcomingFeature("StrictConcurrency")
+            ]
         ),
         .testTarget(
             name: "TrackKitTests",

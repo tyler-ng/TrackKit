@@ -25,103 +25,275 @@ public class NetworkManager {
         self.session = URLSession(configuration: sessionConfig)
     }
     
-    // MARK: - Public Methods
+    // MARK: - Network API
     
     /// Send a single event
     /// - Parameters:
     ///   - event: Event to send
     ///   - context: Request context
-    ///   - completion: Completion handler
+    /// - Returns: EventDeliveryResult
     public func sendSingleEvent(
         _ event: TrackingEvent,
-        context: RequestContext,
-        completion: @escaping (EventDeliveryResult) -> Void
-    ) {
-        queue.async { [weak self] in
-            guard let self = self else { return }
-            
-            let startTime = Date()
-            let endpoint = self.buildEndpoint(for: .single)
-            
-            DispatchQueue.main.async {
-                self.delegate?.networkManager(self, didCompleteRequest: context, result: EventDeliveryResult(
-                    success: false,
-                    error: .invalidURL,
-                    responseTime: 0,
-                    retryCount: 0,
-                    eventId: event.id
-                ))
-            }
-            
-            guard let request = self.buildRequest(
-                endpoint: endpoint,
-                payload: self.payloadFormatter.formatSingleEvent(event),
-                context: context
-            ) else {
-                let result = EventDeliveryResult(
-                    success: false,
-                    error: .invalidURL,
-                    responseTime: 0,
-                    retryCount: context.attemptNumber,
-                    eventId: event.id
-                )
-                DispatchQueue.main.async { completion(result) }
-                return
-            }
-            
-            TrackKitLogger.logNetworkRequest(
-                url: request.url?.absoluteString ?? "",
-                method: request.httpMethod ?? "",
-                headers: request.allHTTPHeaderFields
+        context: RequestContext
+    ) async -> EventDeliveryResult {
+        let startTime = Date()
+        let endpoint = buildEndpoint(for: .single)
+        
+        guard let request = buildRequest(
+            endpoint: endpoint,
+            payload: payloadFormatter.formatSingleEvent(event),
+            context: context
+        ) else {
+            let result = EventDeliveryResult(
+                success: false,
+                error: .invalidURL,
+                responseTime: 0,
+                retryCount: context.attemptNumber,
+                eventId: event.id
             )
             
-            self.performRequest(request, event: event, context: context, startTime: startTime, completion: completion)
+            await notifyDelegate(request: context, result: result)
+            return result
         }
+        
+        TrackKitLogger.logNetworkRequest(
+            url: request.url?.absoluteString ?? "",
+            method: request.httpMethod ?? "",
+            headers: request.allHTTPHeaderFields
+        )
+        
+        return await performSingleEventRequest(
+            request,
+            event: event,
+            context: context,
+            startTime: startTime
+        )
     }
     
     /// Send a batch of events
     /// - Parameters:
     ///   - events: Events to send
     ///   - context: Request context
-    ///   - completion: Completion handler
+    /// - Returns: BatchDeliveryResult
     public func sendBatch(
         _ events: [TrackingEvent],
-        context: RequestContext,
-        completion: @escaping (BatchDeliveryResult) -> Void
-    ) {
-        queue.async { [weak self] in
-            guard let self = self else { return }
-            
-            let startTime = Date()
-            let endpoint = self.buildEndpoint(for: .batch)
-            
-            guard let request = self.buildRequest(
-                endpoint: endpoint,
-                payload: self.payloadFormatter.formatBatchEvents(events),
-                context: context
-            ) else {
-                let result = BatchDeliveryResult(
-                    totalEvents: events.count,
-                    successCount: 0,
-                    failedEvents: events.map { $0.id },
-                    errors: [.invalidURL],
-                    responseTime: 0
-                )
-                DispatchQueue.main.async { completion(result) }
-                return
-            }
-            
-            TrackKitLogger.logNetworkRequest(
-                url: request.url?.absoluteString ?? "",
-                method: request.httpMethod ?? "",
-                headers: request.allHTTPHeaderFields
+        context: RequestContext
+    ) async -> BatchDeliveryResult {
+        let startTime = Date()
+        let endpoint = buildEndpoint(for: .batch)
+        
+        guard let request = buildRequest(
+            endpoint: endpoint,
+            payload: payloadFormatter.formatBatchEvents(events),
+            context: context
+        ) else {
+            let result = BatchDeliveryResult(
+                totalEvents: events.count,
+                successCount: 0,
+                failedEvents: events.map { $0.id },
+                errors: [.invalidURL],
+                responseTime: 0
             )
             
-            self.performBatchRequest(request, events: events, context: context, startTime: startTime, completion: completion)
+            await notifyDelegate(batch: context, result: result)
+            return result
+        }
+        
+        TrackKitLogger.logNetworkRequest(
+            url: request.url?.absoluteString ?? "",
+            method: request.httpMethod ?? "",
+            headers: request.allHTTPHeaderFields
+        )
+        
+        return await performBatchRequest(
+            request,
+            events: events,
+            context: context,
+            startTime: startTime
+        )
+    }
+    
+    // MARK: - Private Implementation
+    
+    private func performSingleEventRequest(
+        _ request: URLRequest,
+        event: TrackingEvent,
+        context: RequestContext,
+        startTime: Date
+    ) async -> EventDeliveryResult {
+        do {
+            let (data, response) = try await session.data(for: request)
+            let responseTime = Date().timeIntervalSince(startTime) * 1000
+            
+            let httpResponse = response as? HTTPURLResponse
+            let statusCode = httpResponse?.statusCode
+            
+            TrackKitLogger.logNetworkResponse(
+                url: request.url?.absoluteString ?? "",
+                statusCode: statusCode ?? 0,
+                responseTime: responseTime
+            )
+            
+            let result: EventDeliveryResult
+            
+            if let statusCode = statusCode, isSuccessStatusCode(statusCode) {
+                result = EventDeliveryResult(
+                    success: true,
+                    error: nil,
+                    responseTime: responseTime,
+                    retryCount: context.attemptNumber,
+                    eventId: event.id,
+                    statusCode: statusCode
+                )
+            } else {
+                result = EventDeliveryResult(
+                    success: false,
+                    error: mapStatusCodeToError(statusCode ?? 0),
+                    responseTime: responseTime,
+                    retryCount: context.attemptNumber,
+                    eventId: event.id,
+                    statusCode: statusCode
+                )
+            }
+            
+            // Handle response with custom handlers
+            await handleSingleEventResponse(
+                data: data,
+                response: response,
+                result: result,
+                context: context
+            )
+            
+            await notifyDelegate(request: context, result: result)
+            return result
+            
+        } catch {
+            let responseTime = Date().timeIntervalSince(startTime) * 1000
+            let result = EventDeliveryResult(
+                success: false,
+                error: mapError(error, statusCode: nil),
+                responseTime: responseTime,
+                retryCount: context.attemptNumber,
+                eventId: event.id
+            )
+            
+            await notifyDelegate(request: context, result: result)
+            return result
         }
     }
     
-    // MARK: - Private Methods
+    private func performBatchRequest(
+        _ request: URLRequest,
+        events: [TrackingEvent],
+        context: RequestContext,
+        startTime: Date
+    ) async -> BatchDeliveryResult {
+        do {
+            let (data, response) = try await session.data(for: request)
+            let responseTime = Date().timeIntervalSince(startTime) * 1000
+            
+            let httpResponse = response as? HTTPURLResponse
+            let statusCode = httpResponse?.statusCode
+            
+            TrackKitLogger.logNetworkResponse(
+                url: request.url?.absoluteString ?? "",
+                statusCode: statusCode ?? 0,
+                responseTime: responseTime
+            )
+            
+            let result: BatchDeliveryResult
+            
+            if let statusCode = statusCode, isSuccessStatusCode(statusCode) {
+                result = BatchDeliveryResult(
+                    totalEvents: events.count,
+                    successCount: events.count,
+                    failedEvents: [],
+                    errors: [],
+                    responseTime: responseTime,
+                    statusCode: statusCode
+                )
+            } else {
+                result = BatchDeliveryResult(
+                    totalEvents: events.count,
+                    successCount: 0,
+                    failedEvents: events.map { $0.id },
+                    errors: [mapStatusCodeToError(statusCode ?? 0)],
+                    responseTime: responseTime,
+                    statusCode: statusCode
+                )
+            }
+            
+            // Handle response with custom handlers
+            await handleBatchResponse(
+                data: data,
+                response: response,
+                result: result,
+                context: context
+            )
+            
+            await notifyDelegate(batch: context, result: result)
+            return result
+            
+        } catch {
+            let responseTime = Date().timeIntervalSince(startTime) * 1000
+            let result = BatchDeliveryResult(
+                totalEvents: events.count,
+                successCount: 0,
+                failedEvents: events.map { $0.id },
+                errors: [mapError(error, statusCode: nil)],
+                responseTime: responseTime
+            )
+            
+            await notifyDelegate(batch: context, result: result)
+            return result
+        }
+    }
+    
+    // MARK: - Response Handling
+    
+    private func handleSingleEventResponse(
+        data: Data,
+        response: URLResponse,
+        result: EventDeliveryResult,
+        context: RequestContext
+    ) async {
+        for handler in configuration.responseHandlers {
+            if result.success {
+                await handler.handleSuccessAsync(data: data, response: response, context: context)
+            } else if let error = result.error {
+                _ = await handler.handleErrorAsync(error: error, response: response, context: context)
+            }
+        }
+    }
+    
+    private func handleBatchResponse(
+        data: Data,
+        response: URLResponse,
+        result: BatchDeliveryResult,
+        context: RequestContext
+    ) async {
+        for handler in configuration.responseHandlers {
+            if result.successCount == result.totalEvents {
+                await handler.handleSuccessAsync(data: data, response: response, context: context)
+            } else if let error = result.errors.first {
+                _ = await handler.handleErrorAsync(error: error, response: response, context: context)
+            }
+        }
+    }
+    
+    // MARK: - Delegate Notification
+    
+    @MainActor
+    private func notifyDelegate(request context: RequestContext, result: EventDeliveryResult) {
+        delegate?.networkManager(self, didCompleteRequest: context, result: result)
+    }
+    
+    @MainActor
+    private func notifyDelegate(batch context: RequestContext, result: BatchDeliveryResult) {
+        delegate?.networkManager(self, didCompleteBatch: context, result: result)
+    }
+    
+    // MARK: - Helper Methods
     
     private func buildEndpoint(for deliveryType: DeliveryType) -> String {
         let baseURL = configuration.baseURL
@@ -185,142 +357,6 @@ public class NetworkManager {
                 request.setValue(value, forHTTPHeaderField: key)
             }
         }
-    }
-    
-    private func performRequest(
-        _ request: URLRequest,
-        event: TrackingEvent,
-        context: RequestContext,
-        startTime: Date,
-        completion: @escaping (EventDeliveryResult) -> Void
-    ) {
-        session.dataTask(with: request) { [weak self] data, response, error in
-            let responseTime = Date().timeIntervalSince(startTime) * 1000 // Convert to milliseconds
-            
-            guard let self = self else { return }
-            
-            let httpResponse = response as? HTTPURLResponse
-            let statusCode = httpResponse?.statusCode
-            
-            TrackKitLogger.logNetworkResponse(
-                url: request.url?.absoluteString ?? "",
-                statusCode: statusCode ?? 0,
-                responseTime: responseTime
-            )
-            
-            let result: EventDeliveryResult
-            
-            if let error = error {
-                result = EventDeliveryResult(
-                    success: false,
-                    error: self.mapError(error, statusCode: statusCode),
-                    responseTime: responseTime,
-                    retryCount: context.attemptNumber,
-                    eventId: event.id,
-                    statusCode: statusCode
-                )
-            } else if let statusCode = statusCode, self.isSuccessStatusCode(statusCode) {
-                result = EventDeliveryResult(
-                    success: true,
-                    error: nil,
-                    responseTime: responseTime,
-                    retryCount: context.attemptNumber,
-                    eventId: event.id,
-                    statusCode: statusCode
-                )
-            } else {
-                result = EventDeliveryResult(
-                    success: false,
-                    error: self.mapStatusCodeToError(statusCode ?? 0),
-                    responseTime: responseTime,
-                    retryCount: context.attemptNumber,
-                    eventId: event.id,
-                    statusCode: statusCode
-                )
-            }
-            
-            // Handle response with custom handlers
-            for handler in self.configuration.responseHandlers {
-                if result.success {
-                    handler.handleSuccess(data: data, response: response!, context: context)
-                } else if let error = result.error {
-                    _ = handler.handleError(error: error, response: response, context: context)
-                }
-            }
-            
-            DispatchQueue.main.async {
-                completion(result)
-                self.delegate?.networkManager(self, didCompleteRequest: context, result: result)
-            }
-        }.resume()
-    }
-    
-    private func performBatchRequest(
-        _ request: URLRequest,
-        events: [TrackingEvent],
-        context: RequestContext,
-        startTime: Date,
-        completion: @escaping (BatchDeliveryResult) -> Void
-    ) {
-        session.dataTask(with: request) { [weak self] data, response, error in
-            let responseTime = Date().timeIntervalSince(startTime) * 1000 // Convert to milliseconds
-            
-            guard let self = self else { return }
-            
-            let httpResponse = response as? HTTPURLResponse
-            let statusCode = httpResponse?.statusCode
-            
-            TrackKitLogger.logNetworkResponse(
-                url: request.url?.absoluteString ?? "",
-                statusCode: statusCode ?? 0,
-                responseTime: responseTime
-            )
-            
-            let result: BatchDeliveryResult
-            
-            if let error = error {
-                result = BatchDeliveryResult(
-                    totalEvents: events.count,
-                    successCount: 0,
-                    failedEvents: events.map { $0.id },
-                    errors: [self.mapError(error, statusCode: statusCode)],
-                    responseTime: responseTime,
-                    statusCode: statusCode
-                )
-            } else if let statusCode = statusCode, self.isSuccessStatusCode(statusCode) {
-                result = BatchDeliveryResult(
-                    totalEvents: events.count,
-                    successCount: events.count,
-                    failedEvents: [],
-                    errors: [],
-                    responseTime: responseTime,
-                    statusCode: statusCode
-                )
-            } else {
-                result = BatchDeliveryResult(
-                    totalEvents: events.count,
-                    successCount: 0,
-                    failedEvents: events.map { $0.id },
-                    errors: [self.mapStatusCodeToError(statusCode ?? 0)],
-                    responseTime: responseTime,
-                    statusCode: statusCode
-                )
-            }
-            
-            // Handle response with custom handlers
-            for handler in self.configuration.responseHandlers {
-                if result.successCount == result.totalEvents {
-                    handler.handleSuccess(data: data, response: response!, context: context)
-                } else if let error = result.errors.first {
-                    _ = handler.handleError(error: error, response: response, context: context)
-                }
-            }
-            
-            DispatchQueue.main.async {
-                completion(result)
-                self.delegate?.networkManager(self, didCompleteBatch: context, result: result)
-            }
-        }.resume()
     }
     
     private func isSuccessStatusCode(_ statusCode: Int) -> Bool {

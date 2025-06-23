@@ -13,6 +13,10 @@ public class EventTracker {
     private weak var deliveryDelegate: EventDeliveryDelegate?
     private let queue = DispatchQueue(label: "com.trackkit.eventtracker", qos: .utility)
     
+    // Track tasks for cancellation
+    private var flushTask: Task<Void, Never>?
+    private var periodicFlushTimer: Timer?
+    
     // MARK: - Initialization
     public init(configuration: TrackKitConfiguration, sessionManager: SessionManager) {
         self.configuration = configuration
@@ -27,59 +31,72 @@ public class EventTracker {
         setupPeriodicFlush()
     }
     
+    deinit {
+        flushTask?.cancel()
+        periodicFlushTimer?.invalidate()
+    }
+    
     // MARK: - Event Tracking
     
     /// Track an event
     /// - Parameter event: Event to track
-    public func track(event: Event) {
-        queue.async { [weak self] in
-            guard let self = self else { return }
-            
-            // Enrich event with session info
-            let enrichedEvent = self.enrichEvent(event)
-            
-            // Add to queue
-            self.eventQueue.enqueue(enrichedEvent)
-            
-            TrackKitLogger.logEventTracked(
-                eventName: enrichedEvent.name,
-                eventType: enrichedEvent.type.rawValue,
-                properties: enrichedEvent.properties
-            )
-            
-            // Determine delivery strategy
-            self.processEvent(enrichedEvent)
+    public func track(event: Event) async {
+        // Enrich event with session info
+        let enrichedEvent = enrichEvent(event)
+        
+        // Add to queue
+        await withCheckedContinuation { continuation in
+            queue.async { [weak self] in
+                self?.eventQueue.enqueue(enrichedEvent)
+                continuation.resume()
+            }
         }
+        
+        TrackKitLogger.logEventTracked(
+            eventName: enrichedEvent.name,
+            eventType: enrichedEvent.type.rawValue,
+            properties: enrichedEvent.properties
+        )
+        
+        // Determine delivery strategy
+        await processEvent(enrichedEvent)
     }
     
     /// Flush all pending events immediately
-    public func flush() {
-        queue.async { [weak self] in
-            self?.flushPendingEvents()
-        }
+    public func flush() async {
+        await flushPendingEvents()
     }
     
     /// Reset tracker state
-    public func reset() {
-        queue.async { [weak self] in
-            self?.eventQueue.clear()
-            self?.batchManager.clear()
-            TrackKitLogger.info("Event tracker reset")
+    public func reset() async {
+        // Cancel ongoing operations
+        flushTask?.cancel()
+        
+        await withCheckedContinuation { continuation in
+            queue.async { [weak self] in
+                self?.eventQueue.clear()
+                continuation.resume()
+            }
         }
+        
+        await batchManager.clear()
+        
+        TrackKitLogger.info("Event tracker reset")
     }
     
     /// Set batch size
-    public func setBatchSize(_ size: Int) {
-        batchManager.setBatchSize(size)
+    public func setBatchSize(_ size: Int) async {
+        await batchManager.setBatchSize(size)
     }
     
     /// Set flush interval
-    public func setFlushInterval(_ interval: TimeInterval) {
-        batchManager.setFlushInterval(interval)
+    public func setFlushInterval(_ interval: TimeInterval) async {
+        await batchManager.setFlushInterval(interval)
+        setupPeriodicFlush() // Restart timer with new interval
     }
     
     /// Set delivery delegate
-    public func setDeliveryDelegate(_ delegate: EventDeliveryDelegate) {
+    public func setDeliveryDelegate(_ delegate: EventDeliveryDelegate) async {
         self.deliveryDelegate = delegate
     }
     
@@ -109,41 +126,53 @@ public class EventTracker {
         }
     }
     
-    private func processEvent(_ event: TrackingEvent) {
+    private func processEvent(_ event: TrackingEvent) async {
         switch event.priority {
         case .critical:
             // Send immediately for critical events
-            sendEventImmediately(event)
+            await sendEventImmediately(event)
         case .high:
             // Send with high priority batch
-            batchManager.addHighPriorityEvent(event)
+            await batchManager.addHighPriorityEvent(event)
         case .normal, .low:
             // Add to regular batch
-            batchManager.addEvent(event)
+            await batchManager.addEvent(event)
         }
     }
     
-    private func sendEventImmediately(_ event: TrackingEvent) {
+    private func sendEventImmediately(_ event: TrackingEvent) async {
         let context = RequestContext(
             eventType: event.type,
             deliveryType: .realtime,
             metadata: ["priority": event.priority.rawValue]
         )
         
-        networkManager.sendSingleEvent(event, context: context) { [weak self] result in
-            DispatchQueue.main.async {
-                self?.deliveryDelegate?.didSendEvent(event, success: result.success, error: result.error)
-            }
-            
-            if !result.success {
-                // Add to regular queue for retry
-                self?.eventQueue.enqueue(event)
+        let result = await networkManager.sendSingleEvent(event, context: context)
+        
+        // Notify delegate on main thread
+        await MainActor.run { [weak self] in
+            self?.deliveryDelegate?.didSendEvent(event, success: result.success, error: result.error)
+        }
+        
+        if !result.success {
+            // Add to regular queue for retry
+            await withCheckedContinuation { continuation in
+                queue.async { [weak self] in
+                    self?.eventQueue.enqueue(event)
+                    continuation.resume()
+                }
             }
         }
     }
     
-    private func flushPendingEvents() {
-        let events = eventQueue.dequeueAll()
+    private func flushPendingEvents() async {
+        let events = await withCheckedContinuation { continuation in
+            queue.async { [weak self] in
+                let events = self?.eventQueue.dequeueAll() ?? []
+                continuation.resume(returning: events)
+            }
+        }
+        
         guard !events.isEmpty else { return }
         
         TrackKitLogger.logBatchOperation(operation: "flush", eventCount: events.count)
@@ -154,29 +183,57 @@ public class EventTracker {
             metadata: ["forced_flush": true]
         )
         
-        networkManager.sendBatch(events, context: context) { [weak self] result in
-            DispatchQueue.main.async {
-                self?.deliveryDelegate?.didSendBatch(events, success: result.successCount == result.totalEvents, error: nil)
-            }
-            
-            // Re-queue failed events
-            if !result.failedEvents.isEmpty {
-                let failedEventObjects = events.filter { result.failedEvents.contains($0.id) }
-                failedEventObjects.forEach { self?.eventQueue.enqueue($0) }
+        let result = await networkManager.sendBatch(events, context: context)
+        
+        // Notify delegate on main thread
+        await MainActor.run { [weak self] in
+            self?.deliveryDelegate?.didSendBatch(
+                events,
+                success: result.successCount == result.totalEvents,
+                error: result.errors.first
+            )
+        }
+        
+        // Re-queue failed events
+        if !result.failedEvents.isEmpty {
+            let failedEventObjects = events.filter { result.failedEvents.contains($0.id) }
+            await withCheckedContinuation { continuation in
+                queue.async { [weak self] in
+                    failedEventObjects.forEach { self?.eventQueue.enqueue($0) }
+                    continuation.resume()
+                }
             }
         }
     }
     
     private func setupPeriodicFlush() {
-        Timer.scheduledTimer(withTimeInterval: configuration.flushInterval, repeats: true) { [weak self] _ in
-            self?.queue.async {
-                let queueSize = self?.eventQueue.count ?? 0
+        periodicFlushTimer?.invalidate()
+        periodicFlushTimer = Timer.scheduledTimer(withTimeInterval: configuration.flushInterval, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            
+            self.queue.async {
+                let queueSize = self.eventQueue.count
                 if queueSize > 0 {
                     TrackKitLogger.debug("Periodic flush triggered, queue size: \(queueSize)")
-                    self?.flushPendingEvents()
+                    
+                    // Cancel previous flush task if running
+                    self.flushTask?.cancel()
+                    
+                    // Start new flush task
+                    self.flushTask = Task { [weak self] in
+                        await self?.flushPendingEvents()
+                    }
                 }
             }
         }
+    }
+    
+    // MARK: - Cancellation Support
+    
+    /// Cancel all ongoing operations
+    public func cancelAllOperations() async {
+        flushTask?.cancel()
+        await batchManager.cancelAllRequests()
     }
 }
 
@@ -201,8 +258,14 @@ extension EventTracker: BatchManagerDelegate {
     }
     
     func batchManager(_ manager: BatchManager, didSendBatch events: [TrackingEvent], result: BatchDeliveryResult) {
-        DispatchQueue.main.async { [weak self] in
-            self?.deliveryDelegate?.didSendBatch(events, success: result.successCount == result.totalEvents, error: nil)
+        Task { [weak self] in
+            await MainActor.run {
+                self?.deliveryDelegate?.didSendBatch(
+                    events,
+                    success: result.successCount == result.totalEvents,
+                    error: result.errors.first
+                )
+            }
         }
     }
 }

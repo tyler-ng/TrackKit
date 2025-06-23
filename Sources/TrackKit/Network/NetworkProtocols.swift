@@ -13,6 +13,29 @@ public protocol ResponseHandler {
     func handleError(error: Error, response: URLResponse?, context: RequestContext) -> Bool // return true if handled
 }
 
+/// Modern async response handler protocol
+public protocol AsyncResponseHandler {
+    func handleSuccess(data: Data?, response: URLResponse, context: RequestContext) async
+    func handleError(error: Error, response: URLResponse?, context: RequestContext) async -> Bool
+}
+
+/// Bridge to make sync handlers work with async system
+extension ResponseHandler {
+    func handleSuccessAsync(data: Data?, response: URLResponse, context: RequestContext) async {
+        await withCheckedContinuation { continuation in
+            self.handleSuccess(data: data, response: response, context: context)
+            continuation.resume()
+        }
+    }
+    
+    func handleErrorAsync(error: Error, response: URLResponse?, context: RequestContext) async -> Bool {
+        return await withCheckedContinuation { continuation in
+            let result = self.handleError(error: error, response: response, context: context)
+            continuation.resume(returning: result)
+        }
+    }
+}
+
 /// Context information for request/response interceptors
 public struct RequestContext {
     public let eventType: EventType
@@ -203,6 +226,7 @@ public struct ContentType {
     public static let json = "application/json"
     public static let formURLEncoded = "application/x-www-form-urlencoded"
     public static let multipartFormData = "multipart/form-data"
+    public static let textPlain = "text/plain"
 }
 
 // MARK: - Request Configuration

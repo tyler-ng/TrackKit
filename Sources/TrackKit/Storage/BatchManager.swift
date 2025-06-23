@@ -15,6 +15,10 @@ public class BatchManager {
     private var flushInterval: TimeInterval
     private var flushTimer: Timer?
     
+    // Track ongoing send tasks for cancellation
+    private var regularSendTask: Task<Void, Never>?
+    private var highPrioritySendTask: Task<Void, Never>?
+    
     private let queue = DispatchQueue(label: "com.trackkit.batch", qos: .utility)
     
     // MARK: - Initialization
@@ -29,75 +33,107 @@ public class BatchManager {
     
     deinit {
         flushTimer?.invalidate()
+        regularSendTask?.cancel()
+        highPrioritySendTask?.cancel()
     }
     
     // MARK: - Public Methods
     
     /// Add an event to the regular batch
     /// - Parameter event: Event to add
-    public func addEvent(_ event: TrackingEvent) {
-        queue.async { [weak self] in
-            guard let self = self else { return }
-            
-            self.regularBatch.append(event)
-            TrackKitLogger.debug("Event added to regular batch: \(event.name), batch size: \(self.regularBatch.count)")
-            
-            if self.regularBatch.count >= self.batchSize {
-                self.flushRegularBatch()
+    public func addEvent(_ event: TrackingEvent) async {
+        await withCheckedContinuation { continuation in
+            queue.async { [weak self] in
+                guard let self = self else { 
+                    continuation.resume()
+                    return 
+                }
+                
+                self.regularBatch.append(event)
+                TrackKitLogger.debug("Event added to regular batch: \(event.name), batch size: \(self.regularBatch.count)")
+                
+                if self.regularBatch.count >= self.batchSize {
+                    self.flushRegularBatch()
+                }
+                
+                continuation.resume()
             }
         }
     }
     
     /// Add an event to the high priority batch
     /// - Parameter event: Event to add
-    public func addHighPriorityEvent(_ event: TrackingEvent) {
-        queue.async { [weak self] in
-            guard let self = self else { return }
-            
-            self.highPriorityBatch.append(event)
-            TrackKitLogger.debug("Event added to high priority batch: \(event.name), batch size: \(self.highPriorityBatch.count)")
-            
-            // High priority batches are smaller and sent more frequently
-            let highPriorityBatchSize = min(self.batchSize / 2, 25)
-            if self.highPriorityBatch.count >= highPriorityBatchSize {
-                self.flushHighPriorityBatch()
+    public func addHighPriorityEvent(_ event: TrackingEvent) async {
+        await withCheckedContinuation { continuation in
+            queue.async { [weak self] in
+                guard let self = self else { 
+                    continuation.resume()
+                    return 
+                }
+                
+                self.highPriorityBatch.append(event)
+                TrackKitLogger.debug("Event added to high priority batch: \(event.name), batch size: \(self.highPriorityBatch.count)")
+                
+                // High priority batches are smaller and sent more frequently
+                let highPriorityBatchSize = min(self.batchSize / 2, 25)
+                if self.highPriorityBatch.count >= highPriorityBatchSize {
+                    self.flushHighPriorityBatch()
+                }
+                
+                continuation.resume()
             }
         }
     }
     
     /// Set batch size
     /// - Parameter size: New batch size
-    public func setBatchSize(_ size: Int) {
-        queue.async { [weak self] in
-            self?.batchSize = max(1, size)
-            TrackKitLogger.debug("Batch size updated: \(size)")
+    public func setBatchSize(_ size: Int) async {
+        await withCheckedContinuation { continuation in
+            queue.async { [weak self] in
+                self?.batchSize = max(1, size)
+                TrackKitLogger.debug("Batch size updated: \(size)")
+                continuation.resume()
+            }
         }
     }
     
     /// Set flush interval
     /// - Parameter interval: New flush interval in seconds
-    public func setFlushInterval(_ interval: TimeInterval) {
-        queue.async { [weak self] in
-            self?.flushInterval = max(1.0, interval)
-            self?.setupFlushTimer()
-            TrackKitLogger.debug("Flush interval updated: \(interval)s")
+    public func setFlushInterval(_ interval: TimeInterval) async {
+        await withCheckedContinuation { continuation in
+            queue.async { [weak self] in
+                self?.flushInterval = max(1.0, interval)
+                self?.setupFlushTimer()
+                TrackKitLogger.debug("Flush interval updated: \(interval)s")
+                continuation.resume()
+            }
         }
     }
     
     /// Flush all batches immediately
-    public func flushAll() {
-        queue.async { [weak self] in
-            self?.flushHighPriorityBatch()
-            self?.flushRegularBatch()
+    public func flushAll() async {
+        await withCheckedContinuation { continuation in
+            queue.async { [weak self] in
+                self?.flushHighPriorityBatch()
+                self?.flushRegularBatch()
+                continuation.resume()
+            }
         }
     }
     
     /// Clear all batches
-    public func clear() {
-        queue.async { [weak self] in
-            self?.regularBatch.removeAll()
-            self?.highPriorityBatch.removeAll()
-            TrackKitLogger.debug("All batches cleared")
+    public func clear() async {
+        await withCheckedContinuation { continuation in
+            queue.async { [weak self] in
+                // Cancel ongoing tasks
+                self?.regularSendTask?.cancel()
+                self?.highPrioritySendTask?.cancel()
+                
+                self?.regularBatch.removeAll()
+                self?.highPriorityBatch.removeAll()
+                TrackKitLogger.debug("All batches cleared")
+                continuation.resume()
+            }
         }
     }
     
@@ -142,7 +178,12 @@ public class BatchManager {
         let eventsToSend = regularBatch
         regularBatch.removeAll()
         
-        sendBatch(eventsToSend, priority: .normal)
+        // Cancel previous task if running
+        regularSendTask?.cancel()
+        
+        regularSendTask = Task { [weak self] in
+            await self?.sendBatch(eventsToSend, priority: .normal)
+        }
     }
     
     private func flushHighPriorityBatch() {
@@ -151,17 +192,24 @@ public class BatchManager {
         let eventsToSend = highPriorityBatch
         highPriorityBatch.removeAll()
         
-        sendBatch(eventsToSend, priority: .high)
+        // Cancel previous task if running
+        highPrioritySendTask?.cancel()
+        
+        highPrioritySendTask = Task { [weak self] in
+            await self?.sendBatch(eventsToSend, priority: .high)
+        }
     }
     
-    private func sendBatch(_ events: [TrackingEvent], priority: EventPriority) {
+    private func sendBatch(_ events: [TrackingEvent], priority: EventPriority) async {
         guard let delegate = delegate, delegate.batchManager(self, shouldSendBatch: events) else {
             // Re-add events if delegate doesn't allow sending
-            queue.async { [weak self] in
-                if priority == .high {
-                    self?.highPriorityBatch.append(contentsOf: events)
-                } else {
-                    self?.regularBatch.append(contentsOf: events)
+            await MainActor.run { [weak self] in
+                self?.queue.async {
+                    if priority == .high {
+                        self?.highPriorityBatch.append(contentsOf: events)
+                    } else {
+                        self?.regularBatch.append(contentsOf: events)
+                    }
                 }
             }
             return
@@ -178,23 +226,36 @@ public class BatchManager {
             ]
         )
         
-        networkManager.sendBatch(events, context: context) { [weak self] result in
-            guard let self = self else { return }
+        do {
+            let result = await networkManager.sendBatch(events, context: context)
             
-            // Notify delegate
-            self.delegate?.batchManager(self, didSendBatch: events, result: result)
+            // Notify delegate on main actor
+            await MainActor.run { [weak self] in
+                self?.delegate?.batchManager(self!, didSendBatch: events, result: result)
+            }
             
-            // Handle failed events
+            // Handle failed events with retry
             if !result.failedEvents.isEmpty {
                 let failedEventObjects = events.filter { result.failedEvents.contains($0.id) }
+                let retryDelay = calculateRetryDelay(for: result.errors.count)
                 
-                // Re-queue failed events with exponential backoff
-                DispatchQueue.main.asyncAfter(deadline: .now() + self.calculateRetryDelay(for: result.errors.count)) {
-                    self.queue.async {
+                // Wait for retry delay with cancellation support
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(retryDelay * 1_000_000_000))
+                } catch {
+                    // Task was cancelled, don't retry
+                    return
+                }
+                
+                // Check if task is still valid before re-queueing
+                guard !Task.isCancelled else { return }
+                
+                await MainActor.run { [weak self] in
+                    self?.queue.async {
                         if priority == .high {
-                            self.highPriorityBatch.append(contentsOf: failedEventObjects)
+                            self?.highPriorityBatch.append(contentsOf: failedEventObjects)
                         } else {
-                            self.regularBatch.append(contentsOf: failedEventObjects)
+                            self?.regularBatch.append(contentsOf: failedEventObjects)
                         }
                         
                         TrackKitLogger.warning("Re-queued \(failedEventObjects.count) failed events for retry")
@@ -208,6 +269,14 @@ public class BatchManager {
         // Exponential backoff: 2^errorCount seconds, max 60 seconds
         let delay = min(pow(2.0, Double(errorCount)), 60.0)
         return delay
+    }
+    
+    // MARK: - Cancellation Support
+    
+    /// Cancel all ongoing network requests
+    public func cancelAllRequests() async {
+        regularSendTask?.cancel()
+        highPrioritySendTask?.cancel()
     }
     
     // MARK: - Batch Statistics

@@ -111,6 +111,58 @@ class ExampleViewController: UIViewController {
         print("Using TrackKit version: \(TrackKit.version)")
     }
     
+    // MARK: - Modern Async/Await Usage
+    
+    private func demonstrateAsyncTrackingUsage() async {
+        // Example of manual flush with async/await
+        await TrackKit.flushAsync()
+        
+        // Example of custom network operations (if exposed)
+        // This would require adding async API to TrackKit main class
+        
+        print("Async tracking operations completed")
+    }
+    
+    // MARK: - Async Button Actions (for modern UI)
+    
+    @available(iOS 15.0, *)
+    @IBAction func asyncTrackEventButton(_ sender: UIButton) {
+        Task {
+            // Track the button press
+            TrackKit.trackButton("async_track_event_button", properties: [
+                "ui_framework": "async_uikit",
+                "timestamp": Date().timeIntervalSince1970
+            ])
+            
+            // Wait for events to be sent
+            await TrackKit.flushAsync()
+            
+            await MainActor.run {
+                showAlert(title: "Success", message: "Event tracked and sent successfully!")
+            }
+        }
+    }
+    
+    @available(iOS 15.0, *)
+    @IBAction func asyncBatchOperationButton(_ sender: UIButton) {
+        Task {
+            // Track multiple events
+            for i in 1...5 {
+                TrackKit.track(event: "batch_event_\(i)", properties: [
+                    "sequence": i,
+                    "batch_id": UUID().uuidString
+                ])
+            }
+            
+            // Force send all events
+            await TrackKit.flushAsync()
+            
+            await MainActor.run {
+                showAlert(title: "Batch Complete", message: "5 events tracked and sent in batch!")
+            }
+        }
+    }
+    
     // MARK: - Button Actions (for testing)
     
     @IBAction func loginButtonTapped(_ sender: UIButton) {
